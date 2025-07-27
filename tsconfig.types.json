@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "declarationDir": "./types",
+    "stripInternal": true
+  },
+  "include": ["server.ts"]
+  // only emit defs for server.ts (where AppRouter lives)
+}
