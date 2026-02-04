@@ -5,11 +5,16 @@
   "license": "MIT",
   "dependencies": {
     "@fastify/cors": "^11.0.1",
+    "@google/genai": "^1.39.0",
+    "@supabase/supabase-js": "^2.94.0",
     "@trpc/server": "^11.4.3",
     "dotenv": "^17.2.1",
     "fastify": "^5.4.0",
+    "google-auth-library": "^10.5.0",
     "jsonwebtoken": "^9.0.2",
+    "mime": "^4.1.0",
     "ngrok": "^5.0.0-beta.2",
+    "openai": "^6.17.0",
     "zod": "^4.0.10"
   },
   "devDependencies": {
