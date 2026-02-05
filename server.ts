@@ -251,6 +251,7 @@ function createTRPCRouter(server: any) {
       const { data } = await supabase
         .from("stores")
         .select("*")
+        .eq("is_deleted", false)
         .order("name");
       return (data || []) as Store[];
     }),
@@ -274,7 +275,10 @@ function createTRPCRouter(server: any) {
         if (error) {
           console.warn("PostGIS query failed, falling back to basic query:", error.message);
           // Fallback: return all stores (for development without PostGIS)
-          const { data: allStores } = await supabase.from("stores").select("*");
+          const { data: allStores } = await supabase
+            .from("stores")
+            .select("*")
+            .eq("is_deleted", false);
           return (allStores || []) as Store[];
         }
         
@@ -321,6 +325,7 @@ function createTRPCRouter(server: any) {
           .from("stores")
           .select("*")
           .ilike("name", `%${input.name}%`)
+          .eq("is_deleted", false)
           .limit(1)
           .single();
         
@@ -340,6 +345,49 @@ function createTRPCRouter(server: any) {
         
         if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         return data as Store;
+      }),
+
+    storesCheckDuplicate: protectedProcedure
+      .input(z.object({
+        name: z.string(),
+        address: z.string().optional(),
+        latitude: z.number(),
+        longitude: z.number(),
+      }))
+      .mutation(async ({ input }) => {
+        if (!supabase) return { status: "none" };
+
+        // 1. Check for exact name match
+        const { data: nameMatch } = await supabase
+          .from("stores")
+          .select("*")
+          .ilike("name", input.name) // Case-insensitive exact match
+          .eq("is_deleted", false)
+          .single();
+
+        if (nameMatch) {
+          return { status: "exact", message: "A store with this exact name already exists.", store: nameMatch };
+        }
+
+        // 2. Check for location proximity (approx 100m)
+        // Simple bounding box check for speed/simplicity without PostGIS complexity here
+        // 0.001 degrees is roughly 111 meters
+        const { data: locMatch } = await supabase
+          .from("stores")
+          .select("*")
+          .eq("is_deleted", false)
+          .gte("latitude", input.latitude - 0.001)
+          .lte("latitude", input.latitude + 0.001)
+          .gte("longitude", input.longitude - 0.001)
+          .lte("longitude", input.longitude + 0.001)
+          .limit(1)
+          .single();
+
+        if (locMatch) {
+          return { status: "exact", message: `A store is already at this location: "${locMatch.name}"`, store: locMatch };
+        }
+
+        return { status: "none" };
       }),
 
     storesVisited: protectedProcedure
@@ -363,7 +411,8 @@ function createTRPCRouter(server: any) {
         const { data: stores } = await supabase
           .from("stores")
           .select("*")
-          .in("id", storeIds);
+          .in("id", storeIds)
+          .eq("is_deleted", false);
           
         return (stores || []) as Store[];
       }),
@@ -546,6 +595,7 @@ function createTRPCRouter(server: any) {
           .from("receipts")
           .select("*, stores(*)")
           .eq("user_id", ctx.user.userId)
+          .eq("is_deleted", false)
           .order("created_at", { ascending: false })
           .limit(input?.limit || 20);
         

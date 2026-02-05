@@ -21,7 +21,7 @@ BEGIN
   -- visit_count for tracking
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                  WHERE table_name = 'stores' AND column_name = 'visit_count') THEN
-    ALTER TABLE stores ADD COLUMN visit_count INTEGER DEFAULT 0;
+    ALTER TABLE stores ADD COLUMN visit_count INTEGER DEFAULT 0 NOT NULL;
   END IF;
 END $$;
 
@@ -60,7 +60,7 @@ AS $$
     ST_SetSRID(ST_MakePoint(lng, lat), 4326)::geography,
     radius_km * 1000
   )
-  AND (is_deleted IS NULL OR is_deleted = false)
+  AND is_deleted = false
   ORDER BY location <-> ST_SetSRID(ST_MakePoint(lng, lat), 4326)::geography;
 $$;
 
@@ -71,10 +71,10 @@ $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can update stores') THEN
-    CREATE POLICY "Users can update stores" ON stores FOR UPDATE USING (true);
+    CREATE POLICY "Users can update stores" ON stores FOR UPDATE USING (auth.uid() = created_by);
   END IF;
   
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can update receipts') THEN
-    CREATE POLICY "Users can update receipts" ON receipts FOR UPDATE USING (true);
+    CREATE POLICY "Users can update receipts" ON receipts FOR UPDATE USING (auth.uid() = user_id);
   END IF;
 END $$;

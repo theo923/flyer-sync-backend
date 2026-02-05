@@ -10,7 +10,7 @@ CREATE INDEX IF NOT EXISTS prices_published_idx ON prices(published) WHERE publi
 -- Bookmarks table for product subscriptions
 CREATE TABLE IF NOT EXISTS bookmarks (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
   notify_on_price_drop BOOLEAN DEFAULT true,
   target_price DECIMAL(10,2),  -- Alert when price drops below this
@@ -20,10 +20,29 @@ CREATE TABLE IF NOT EXISTS bookmarks (
   UNIQUE(user_id, product_id)
 );
 
+-- Enable Row Level Security (RLS) on bookmarks
+ALTER TABLE bookmarks ENABLE ROW LEVEL SECURITY;
+
+-- Allow users to view their own bookmarks
+CREATE POLICY "Users can view their own bookmarks" ON bookmarks
+  FOR SELECT USING (auth.uid() = user_id);
+
+-- Allow users to create their own bookmarks
+CREATE POLICY "Users can create their own bookmarks" ON bookmarks
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+-- Allow users to update their own bookmarks
+CREATE POLICY "Users can update their own bookmarks" ON bookmarks
+  FOR UPDATE USING (auth.uid() = user_id);
+
+-- Allow users to delete their own bookmarks
+CREATE POLICY "Users can delete their own bookmarks" ON bookmarks
+  FOR DELETE USING (auth.uid() = user_id);
+
 -- Price alerts / notifications table
 CREATE TABLE IF NOT EXISTS price_alerts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   bookmark_id UUID NOT NULL REFERENCES bookmarks(id) ON DELETE CASCADE,
   product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
   price_id UUID REFERENCES prices(id) ON DELETE SET NULL,
@@ -34,6 +53,21 @@ CREATE TABLE IF NOT EXISTS price_alerts (
   is_read BOOLEAN DEFAULT false,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- Enable Row Level Security (RLS) on price_alerts
+ALTER TABLE price_alerts ENABLE ROW LEVEL SECURITY;
+
+-- Allow users to view their own alerts
+CREATE POLICY "Users can view their own alerts" ON price_alerts
+  FOR SELECT USING (auth.uid() = user_id);
+
+-- Allow users to update their own alerts (e.g. mark as read)
+CREATE POLICY "Users can update their own alerts" ON price_alerts
+  FOR UPDATE USING (auth.uid() = user_id);
+
+-- Allow users to delete their own alerts
+CREATE POLICY "Users can delete their own alerts" ON price_alerts
+  FOR DELETE USING (auth.uid() = user_id);
 
 -- Indexes for efficient bookmark queries
 CREATE INDEX IF NOT EXISTS bookmarks_user_idx ON bookmarks(user_id);
@@ -60,7 +94,7 @@ BEGIN
     
     -- If new price is lower than previous, create an alert
     IF prev_price IS NOT NULL AND NEW.price < prev_price THEN
-      INSERT INTO price_alerts (user_id, bookmark_id, product_id, price_id, alert_type, old_price, new_price, store_name)
+      INSERT INTO price_alerts (user_id, bookmark_id, product_id, price_id, alert_type, old_price, new_price, store_name, created_at)
       SELECT 
         bookmark.user_id,
         bookmark.id,
@@ -69,12 +103,13 @@ BEGIN
         'price_drop',
         prev_price,
         NEW.price,
-        (SELECT name FROM stores WHERE id = NEW.store_id);
+        (SELECT name FROM stores WHERE id = NEW.store_id),
+        NOW();
     END IF;
     
     -- If target price is set and new price is at or below target
     IF bookmark.target_price IS NOT NULL AND NEW.price <= bookmark.target_price THEN
-      INSERT INTO price_alerts (user_id, bookmark_id, product_id, price_id, alert_type, old_price, new_price, store_name)
+      INSERT INTO price_alerts (user_id, bookmark_id, product_id, price_id, alert_type, old_price, new_price, store_name, created_at)
       SELECT 
         bookmark.user_id,
         bookmark.id,
@@ -83,7 +118,8 @@ BEGIN
         'target_reached',
         prev_price,
         NEW.price,
-        (SELECT name FROM stores WHERE id = NEW.store_id);
+        (SELECT name FROM stores WHERE id = NEW.store_id),
+        NOW();
     END IF;
   END LOOP;
   

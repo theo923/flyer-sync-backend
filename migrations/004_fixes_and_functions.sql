@@ -1,18 +1,18 @@
 -- Fix missing function for rankings
-CREATE OR REPLACE FUNCTION get_top_contributors(lim INT)
+CREATE OR REPLACE FUNCTION get_top_contributors(lim INTEGER DEFAULT 10)
 RETURNS TABLE (
   "userId" UUID,
-  count BIGINT
+  "count" BIGINT
 ) AS $$
 BEGIN
   RETURN QUERY
-  SELECT user_id as "userId", COUNT(*) as count
+  SELECT user_id as "userId", COUNT(*) as "count"
   FROM prices
   GROUP BY user_id
-  ORDER BY count DESC
+  ORDER BY "count" DESC
   LIMIT lim;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql STABLE;
 
 -- RE-APPLY fix for the "table u" error in check_price_drop_alerts if it failed before
 -- (This overrides the previous function definition)
