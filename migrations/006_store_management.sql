@@ -78,7 +78,9 @@ DO $$
 BEGIN
   -- Update the INSERT policy to track who created the store
   -- Drop the old policy if it exists and create a new one
-  DROP POLICY IF EXISTS "Stores can be created by anyone" ON stores;
+  IF EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Stores can be created by anyone') THEN
+    DROP POLICY "Stores can be created by anyone" ON stores;
+  END IF;
   
   IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Authenticated users can create stores') THEN
     CREATE POLICY "Authenticated users can create stores"
