@@ -78,11 +78,11 @@ DO $$
 BEGIN
   -- Update the INSERT policy to track who created the store
   -- Drop the old policy if it exists and create a new one
-  IF EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Stores can be created by anyone') THEN
+  IF EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'stores' AND policyname = 'Stores can be created by anyone') THEN
     DROP POLICY "Stores can be created by anyone" ON stores;
   END IF;
   
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Authenticated users can create stores') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'stores' AND policyname = 'Authenticated users can create stores') THEN
     CREATE POLICY "Authenticated users can create stores"
       ON stores
       FOR INSERT
@@ -90,17 +90,17 @@ BEGIN
       WITH CHECK (auth.uid() = created_by);
   END IF;
   
-  -- Allow users to update only the stores they created
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can update stores') THEN
+  -- Allow users to update only the stores they created (or stores with NULL created_by for backward compatibility)
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'stores' AND policyname = 'Users can update stores') THEN
     CREATE POLICY "Users can update stores" 
       ON stores 
       FOR UPDATE 
-      USING (auth.uid() = created_by)
+      USING (auth.uid() = created_by OR created_by IS NULL)
       WITH CHECK (auth.uid() = created_by);
   END IF;
   
   -- Allow users to update only their own receipts
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can update receipts') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'receipts' AND policyname = 'Users can update receipts') THEN
     CREATE POLICY "Users can update receipts" 
       ON receipts 
       FOR UPDATE 
