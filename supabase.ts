@@ -80,3 +80,46 @@ export interface ReceiptWithDetails extends Receipt {
   prices?: PriceWithDetails[];
 }
 
+export interface Vote {
+  id: string;
+  user_id: string;
+  target_type: "product" | "price" | "discussion" | "store";
+  target_id: string;
+  vote_type: "up" | "down";
+  created_at: string;
+}
+
+export interface Discussion {
+  id: string;
+  user_id: string;
+  target_type: "product" | "price" | "store";
+  target_id: string;
+  parent_id: string | null;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Bookmark {
+  id: string;
+  user_id: string;
+  product_id: string;
+  notify_on_price_drop: boolean;
+  target_price: number | null;
+  created_at: string;
+}
+
+export interface PriceAlert {
+  id: string;
+  user_id: string;
+  bookmark_id: string;
+  product_id: string;
+  price_id: string | null;
+  alert_type: "price_drop" | "target_reached" | "new_price";
+  old_price: number | null;
+  new_price: number | null;
+  store_name: string | null;
+  is_read: boolean;
+  created_at: string;
+}
+

@@ -11,7 +11,7 @@ import * as dotenv from "dotenv";
 import path from "path";
 import { createHash } from "crypto";
 
-import { supabase, type Product, type Store, type Price, type PriceWithDetails, type Receipt, type ReceiptWithDetails } from "./supabase";
+import { supabase, type Product, type Store, type Price, type PriceWithDetails, type Receipt, type ReceiptWithDetails, type Vote, type Discussion, type Bookmark, type PriceAlert } from "./supabase";
 import { parseReceiptImage, type ParsedReceipt } from "./gemini";
 
 dotenv.config();
@@ -251,6 +251,7 @@ function createTRPCRouter(server: any) {
       const { data } = await supabase
         .from("stores")
         .select("*")
+        .eq("is_deleted", false)
         .order("name");
       return (data || []) as Store[];
     }),
@@ -274,11 +275,27 @@ function createTRPCRouter(server: any) {
         if (error) {
           console.warn("PostGIS query failed, falling back to basic query:", error.message);
           // Fallback: return all stores (for development without PostGIS)
-          const { data: allStores } = await supabase.from("stores").select("*");
+          const { data: allStores } = await supabase
+            .from("stores")
+            .select("*")
+            .eq("is_deleted", false);
           return (allStores || []) as Store[];
         }
         
         return (data || []) as Store[];
+      }),
+
+    storesGetById: publicProcedure
+      .input(z.object({ storeId: z.string().uuid() }))
+      .query(async ({ input }) => {
+        if (!supabase) return null;
+        const { data } = await supabase
+          .from("stores")
+          .select("*")
+          .eq("id", input.storeId)
+          .eq("is_deleted", false)
+          .maybeSingle();
+        return data as Store | null;
       }),
 
     storesCreate: protectedProcedure
@@ -321,6 +338,7 @@ function createTRPCRouter(server: any) {
           .from("stores")
           .select("*")
           .ilike("name", `%${input.name}%`)
+          .eq("is_deleted", false)
           .limit(1)
           .single();
         
@@ -340,6 +358,70 @@ function createTRPCRouter(server: any) {
         
         if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
         return data as Store;
+      }),
+
+    storesCheckDuplicate: protectedProcedure
+      .input(z.object({
+        name: z.string(),
+        address: z.string().optional(),
+        latitude: z.number(),
+        longitude: z.number(),
+      }))
+      .mutation(async ({ input }) => {
+        if (!supabase) return { status: "none" };
+
+        // 1. Check for exact name match
+        const { data: nameMatch } = await supabase
+          .from("stores")
+          .select("*")
+          .ilike("name", input.name) // Case-insensitive full match
+          .eq("is_deleted", false)
+          .maybeSingle();
+
+        if (nameMatch) {
+          return { status: "exact", message: "A store with this exact name already exists.", store: nameMatch };
+        }
+
+        // 2. Check for location proximity (approx 100m)
+        // Simple bounding box check for speed/simplicity without PostGIS complexity here
+        // 0.001 degrees is roughly 111 meters
+        const { data: locMatch } = await supabase
+          .from("stores")
+          .select("*")
+          .eq("is_deleted", false)
+          .gte("latitude", input.latitude - 0.001)
+          .lte("latitude", input.latitude + 0.001)
+          .gte("longitude", input.longitude - 0.001)
+          .lte("longitude", input.longitude + 0.001)
+          .limit(1)
+          .maybeSingle();
+
+        if (locMatch) {
+          return { status: "location", message: `A store is already at this location: "${locMatch.name}"`, store: locMatch };
+        }
+
+        return { status: "none" };
+      }),
+
+    storesRecordVisit: protectedProcedure
+      .input(z.object({ storeId: z.string().uuid() }))
+      .mutation(async ({ input, ctx }) => {
+        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        // Just log it or update a last_visited timestamp if it existed. 
+        // For now, we'll just return success to satisfy the frontend.
+        return { success: true };
+      }),
+
+    storesSoftDelete: protectedProcedure
+      .input(z.object({ storeId: z.string().uuid() }))
+      .mutation(async ({ input, ctx }) => {
+        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        const { error } = await supabase
+          .from("stores")
+          .update({ is_deleted: true })
+          .eq("id", input.storeId);
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return { success: true };
       }),
 
     storesVisited: protectedProcedure
@@ -363,9 +445,39 @@ function createTRPCRouter(server: any) {
         const { data: stores } = await supabase
           .from("stores")
           .select("*")
-          .in("id", storeIds);
+          .in("id", storeIds)
+          .eq("is_deleted", false);
           
         return (stores || []) as Store[];
+      }),
+
+    storeStats: protectedProcedure
+      .input(z.object({ storeId: z.string().uuid() }))
+      .query(async ({ input, ctx }) => {
+        if (!supabase) return { totalSpent: 0, avgPerItem: 0, thisMonthSpent: 0, itemCount: 0 };
+
+        const now = new Date();
+        const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+
+        const { data: prices } = await supabase
+          .from("prices")
+          .select("price")
+          .eq("store_id", input.storeId)
+          .eq("user_id", ctx.user.userId);
+
+        const { data: monthlyPrices } = await supabase
+          .from("prices")
+          .select("price")
+          .eq("store_id", input.storeId)
+          .eq("user_id", ctx.user.userId)
+          .gte("detected_at", firstDayOfMonth);
+
+        const totalSpent = prices?.reduce((sum, p) => sum + Number(p.price), 0) || 0;
+        const itemCount = prices?.length || 0;
+        const avgPerItem = itemCount > 0 ? totalSpent / itemCount : 0;
+        const thisMonthSpent = monthlyPrices?.reduce((sum, p) => sum + Number(p.price), 0) || 0;
+
+        return { totalSpent, avgPerItem, thisMonthSpent, itemCount };
       }),
 
     // ─────────────────────────────────────────────────────────────
@@ -462,6 +574,25 @@ function createTRPCRouter(server: any) {
         return (data || []) as PriceWithDetails[];
       }),
 
+    pricesByStore: protectedProcedure
+      .input(z.object({ 
+        storeId: z.string().uuid(),
+        limit: z.number().default(50)
+      }))
+      .query(async ({ input, ctx }) => {
+        if (!supabase) return [];
+        
+        const { data } = await supabase
+          .from("prices")
+          .select("*, products(*)")
+          .eq("store_id", input.storeId)
+          .eq("user_id", ctx.user.userId)
+          .order("detected_at", { ascending: false })
+          .limit(input.limit);
+        
+        return (data || []) as PriceWithDetails[];
+      }),
+
     // ─────────────────────────────────────────────────────────────
     // AI RECEIPT PARSING
     // ─────────────────────────────────────────────────────────────
@@ -546,6 +677,7 @@ function createTRPCRouter(server: any) {
           .from("receipts")
           .select("*, stores(*)")
           .eq("user_id", ctx.user.userId)
+          .eq("is_deleted", false)
           .order("created_at", { ascending: false })
           .limit(input?.limit || 20);
         
@@ -573,6 +705,19 @@ function createTRPCRouter(server: any) {
           .order("detected_at", { ascending: false });
         
         return { ...receipt, prices: prices || [] } as ReceiptWithDetails;
+      }),
+
+    receiptsSoftDelete: protectedProcedure
+      .input(z.object({ receiptId: z.string().uuid() }))
+      .mutation(async ({ input, ctx }) => {
+        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        const { error } = await supabase
+          .from("receipts")
+          .update({ is_deleted: true })
+          .eq("id", input.receiptId)
+          .eq("user_id", ctx.user.userId);
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return { success: true };
       }),
 
     // ─────────────────────────────────────────────────────────────
@@ -613,6 +758,343 @@ function createTRPCRouter(server: any) {
         receiptCount: receiptCount || 0,
       };
     }),
+    
+    // ─────────────────────────────────────────────────────────────
+    // VOTING
+    // ─────────────────────────────────────────────────────────────
+    voteGetCounts: publicProcedure
+      .input(z.object({
+        targetType: z.enum(['product', 'price', 'discussion', 'store']),
+        targetId: z.string().uuid(),
+      }))
+      .query(async ({ input }) => {
+        const db = supabase;
+        if (!db) return { upvotes: 0, downvotes: 0 };
+        
+        const { data, error } = await db.rpc('get_vote_counts', {
+          p_target_type: input.targetType,
+          p_target_id: input.targetId,
+        });
+        
+        if (error) {
+          // Fallback if RPC fails
+          const { data: votes } = await db
+            .from('votes')
+            .select('vote_type')
+            .eq('target_type', input.targetType)
+            .eq('target_id', input.targetId);
+            
+          const upvotes = votes?.filter(v => v.vote_type === 'up').length || 0;
+          const downvotes = votes?.filter(v => v.vote_type === 'down').length || 0;
+          return { upvotes, downvotes };
+        }
+        
+        return {
+          upvotes: Number(data[0]?.upvotes || 0),
+          downvotes: Number(data[0]?.downvotes || 0),
+        };
+      }),
+
+    voteGetUserVote: protectedProcedure
+      .input(z.object({
+        targetType: z.enum(['product', 'price', 'discussion', 'store']),
+        targetId: z.string().uuid(),
+      }))
+      .query(async ({ input, ctx }) => {
+        const db = supabase;
+        if (!db) return null;
+        
+        const { data } = await db
+          .from('votes')
+          .select('vote_type')
+          .eq('user_id', ctx.user.userId)
+          .eq('target_type', input.targetType)
+          .eq('target_id', input.targetId)
+          .maybeSingle();
+          
+        return data?.vote_type || null;
+      }),
+
+    voteSubmit: protectedProcedure
+      .input(z.object({
+        targetType: z.enum(['product', 'price', 'discussion', 'store']),
+        targetId: z.string().uuid(),
+        voteType: z.enum(['up', 'down']),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        
+        const { error } = await supabase
+          .from('votes')
+          .upsert({
+            user_id: ctx.user.userId,
+            target_type: input.targetType,
+            target_id: input.targetId,
+            vote_type: input.voteType,
+          }, { 
+            onConflict: 'user_id,target_type,target_id' 
+          });
+          
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return { success: true };
+      }),
+
+    voteRemove: protectedProcedure
+      .input(z.object({
+        targetType: z.enum(['product', 'price', 'discussion', 'store']),
+        targetId: z.string().uuid(),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        
+        const { error } = await supabase
+          .from('votes')
+          .delete()
+          .eq('user_id', ctx.user.userId)
+          .eq('target_type', input.targetType)
+          .eq('target_id', input.targetId);
+          
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return { success: true };
+      }),
+
+    // ─────────────────────────────────────────────────────────────
+    // DISCUSSIONS
+    // ─────────────────────────────────────────────────────────────
+    discussionList: publicProcedure
+      .input(z.object({
+        targetType: z.enum(['product', 'price', 'store']),
+        targetId: z.string().uuid(),
+        page: z.number().default(1),
+        pageSize: z.number().default(10),
+      }))
+      .query(async ({ input }) => {
+        if (!supabase) return { discussions: [], totalCount: 0, totalPages: 0, currentPage: 1, hasMore: false };
+        
+        const from = (input.page - 1) * input.pageSize;
+        const to = from + input.pageSize - 1;
+        
+        const { data, count, error } = await supabase
+          .from('discussions')
+          .select('*', { count: 'exact' })
+          .eq('target_type', input.targetType)
+          .eq('target_id', input.targetId)
+          .order('created_at', { ascending: false })
+          .range(from, to);
+          
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        
+        const totalCount = count || 0;
+        const totalPages = Math.ceil(totalCount / input.pageSize);
+        
+        return {
+          discussions: data as Discussion[],
+          totalCount,
+          totalPages,
+          currentPage: input.page,
+          hasMore: input.page < totalPages,
+        };
+      }),
+
+    discussionCreate: protectedProcedure
+      .input(z.object({
+        targetType: z.enum(['product', 'price', 'store']),
+        targetId: z.string().uuid(),
+        content: z.string().min(1).max(2000),
+        parentId: z.string().uuid().optional(),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        
+        const { data, error } = await supabase
+          .from('discussions')
+          .insert({
+            user_id: ctx.user.userId,
+            target_type: input.targetType,
+            target_id: input.targetId,
+            content: input.content,
+            parent_id: input.parentId || null,
+          })
+          .select()
+          .single();
+          
+          if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return data as Discussion;
+      }),
+
+    // ─────────────────────────────────────────────────────────────
+    // BOOKMARKS & ALERTS
+    // ─────────────────────────────────────────────────────────────
+    bookmarksList: protectedProcedure
+      .input(z.object({
+        page: z.number().default(1),
+        pageSize: z.number().default(20),
+      }))
+      .query(async ({ input, ctx }) => {
+        const db = supabase;
+        if (!db) return { bookmarks: [], totalCount: 0, totalPages: 0, currentPage: 1, hasMore: false };
+        
+        const from = (input.page - 1) * input.pageSize;
+        const to = from + input.pageSize - 1;
+        
+        // 1. Get bookmarks
+        const { data, count, error } = await db
+          .from('bookmarks')
+          .select('*, products(*)', { count: 'exact' })
+          .eq('user_id', ctx.user.userId)
+          .order('created_at', { ascending: false })
+          .range(from, to);
+          
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        
+        // 2. For each bookmark, fetch price stats
+        const bookmarksWithStats = await Promise.all((data || []).map(async (bookmark) => {
+          const { data: prices } = await db
+            .from('prices')
+            .select('price, detected_at, stores(name)')
+            .eq('product_id', bookmark.product_id)
+            .order('detected_at', { ascending: false });
+            
+          const priceValues = (prices || []).map(p => Number(p.price));
+          const stats = {
+            lowest: priceValues.length > 0 ? Math.min(...priceValues) : null,
+            average: priceValues.length > 0 ? priceValues.reduce((a, b) => a + b, 0) / priceValues.length : null,
+            highest: priceValues.length > 0 ? Math.max(...priceValues) : null,
+            recentPrices: prices || [],
+          };
+          
+          return {
+            ...bookmark,
+            priceStats: stats,
+          };
+        }));
+        
+        const totalCount = count || 0;
+        const totalPages = Math.ceil(totalCount / input.pageSize);
+        
+        return {
+          bookmarks: bookmarksWithStats,
+          totalCount,
+          totalPages,
+          currentPage: input.page,
+          hasMore: input.page < totalPages,
+        };
+      }),
+
+    bookmarkCreate: protectedProcedure
+      .input(z.object({
+        productId: z.string().uuid(),
+        notifyOnPriceDrop: z.boolean().default(true),
+        targetPrice: z.number().optional(),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        
+        const { data, error } = await supabase
+          .from('bookmarks')
+          .upsert({
+            user_id: ctx.user.userId,
+            product_id: input.productId,
+            notify_on_price_drop: input.notifyOnPriceDrop,
+            target_price: input.targetPrice || null,
+          }, { 
+            onConflict: 'user_id,product_id' 
+          })
+          .select()
+          .single();
+          
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return data as Bookmark;
+      }),
+
+    bookmarkDelete: protectedProcedure
+      .input(z.object({
+        productId: z.string().uuid(),
+      }))
+      .mutation(async ({ input, ctx }) => {
+        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        
+        const { error } = await supabase
+          .from('bookmarks')
+          .delete()
+          .eq('user_id', ctx.user.userId)
+          .eq('product_id', input.productId);
+          
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return { success: true };
+      }),
+
+    bookmarkCheck: protectedProcedure
+      .input(z.object({
+        productId: z.string().uuid(),
+      }))
+      .query(async ({ input, ctx }) => {
+        if (!supabase) return null;
+        
+        const { data } = await supabase
+          .from('bookmarks')
+          .select('*')
+          .eq('user_id', ctx.user.userId)
+          .eq('product_id', input.productId)
+          .maybeSingle();
+          
+        return data as Bookmark | null;
+      }),
+
+    priceAlertsList: protectedProcedure
+      .input(z.object({
+        unreadOnly: z.boolean().default(false),
+        limit: z.number().default(50),
+      }))
+      .query(async ({ input, ctx }) => {
+        const db = supabase;
+        if (!db) return { alerts: [], totalCount: 0 };
+        
+        let query = db
+          .from('price_alerts')
+          .select('*, products(*)', { count: 'exact' })
+          .eq('user_id', ctx.user.userId)
+          .order('created_at', { ascending: false })
+          .limit(input.limit);
+          
+        if (input.unreadOnly) {
+          query = query.eq('is_read', false);
+        }
+        
+        const { data, count, error } = await query;
+          
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        
+        return {
+          alerts: data as PriceAlert[],
+          totalCount: count || 0,
+        };
+      }),
+
+    priceAlertsMarkAsRead: protectedProcedure
+      .input(z.object({
+        alertId: z.string().uuid().optional(), // If null, mark all as read
+      }))
+      .mutation(async ({ input, ctx }) => {
+        const db = supabase;
+        if (!db) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+        
+        let query = db
+          .from('price_alerts')
+          .update({ is_read: true })
+          .eq('user_id', ctx.user.userId);
+          
+        if (input.alertId) {
+          query = query.eq('id', input.alertId);
+        } else {
+          query = query.eq('is_read', false);
+        }
+        
+        const { error } = await query;
+          
+        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+        return { success: true };
+      }),
 
     health: publicProcedure.query(() => ({
       status: "ok",
