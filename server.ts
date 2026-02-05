@@ -1,18 +1,15 @@
 import Fastify from "fastify";
 import fastifyCors from "@fastify/cors";
 import fastifyJwt from "@fastify/jwt";
-import { initTRPC, TRPCError } from "@trpc/server";
 import { fastifyTRPCPlugin } from "@trpc/server/adapters/fastify";
 import * as ngrok from "ngrok";
 import { writeFile, mkdir } from "fs/promises";
-import { z } from "zod";
 import type { FastifyRequest, FastifyReply } from "fastify";
 import * as dotenv from "dotenv";
 import path from "path";
-import { createHash } from "crypto";
 
-import { supabase, type Product, type Store, type Price, type PriceWithDetails, type Receipt, type ReceiptWithDetails, type Vote, type Discussion, type Bookmark, type PriceAlert } from "./supabase";
-import { parseReceiptImage, type ParsedReceipt } from "./gemini";
+import { supabase } from "./supabase";
+import { appRouter, type AppRouter } from "./routers";
 
 dotenv.config();
 
@@ -56,12 +53,12 @@ async function createServer() {
   });
 
   process.on("uncaughtException", (error) => {
-  console.error("💥 Uncaught Exception:", error);
-});
+    console.error("💥 Uncaught Exception:", error);
+  });
 
-process.on("unhandledRejection", (reason) => {
-  console.error("🌋 Unhandled Rejection:", reason);
-});
+  process.on("unhandledRejection", (reason) => {
+    console.error("🌋 Unhandled Rejection:", reason);
+  });
 
   server.addHook("preHandler", async (req: FastifyRequest) => {
     console.log(`→ ${req.method} ${req.url} (${req.headers["content-length"] || 0} bytes)`);
@@ -88,1062 +85,40 @@ process.on("unhandledRejection", (reason) => {
   return server;
 }
 
-function createTRPCRouter(server: any) {
-  const t = initTRPC
-    .context<{ user: { userId: string; role?: string } | null }>()
-    .create();
-
-  const publicProcedure = t.procedure;
-  const protectedProcedure = t.procedure.use(({ ctx, next }) => {
-    if (!ctx.user) {
-      throw new TRPCError({ code: "UNAUTHORIZED" });
-    }
-    return next({ ctx: { ...ctx, user: ctx.user } });
-  });
-
-  return t.router({
-    // ─────────────────────────────────────────────────────────────
-    // LEGACY ENDPOINTS (backward compatibility)
-    // ─────────────────────────────────────────────────────────────
-    getReceipts: protectedProcedure.query(async ({ ctx }) => {
-      if (!supabase) return [];
-      const { data } = await supabase
-        .from("prices")
-        .select("*, products(*), stores(*)")
-        .eq("user_id", ctx.user.userId)
-        .order("detected_at", { ascending: false })
-        .limit(50);
-      return data || [];
-    }),
-
-    uploadReceipt: protectedProcedure
-      .input(z.object({ imageBase64: z.string() }))
-      .mutation(async ({ input, ctx }) => {
-        // Save locally as backup
-        const uploadsDir = path.join(process.cwd(), "uploads");
-        await mkdir(uploadsDir, { recursive: true }).catch(() => {});
-        
-        const buffer = Buffer.from(input.imageBase64, "base64");
-        const filename = `${Date.now()}-${ctx.user.userId}.jpg`;
-        const filepath = path.join(uploadsDir, filename);
-        await writeFile(filepath, buffer);
-        
-        // Also upload to Supabase Storage if configured
-        let storagePath = filepath;
-        if (supabase) {
-          const { data, error } = await supabase.storage
-            .from("receipts")
-            .upload(`${ctx.user.userId}/${filename}`, buffer, {
-              contentType: "image/jpeg",
-            });
-          if (data) storagePath = data.path;
-          if (error) console.warn("Storage upload failed:", error.message);
-        }
-        
-        console.log(`✔ Receipt saved: ${storagePath}`);
-        return { success: true, path: storagePath };
-      }),
-
-    // ─────────────────────────────────────────────────────────────
-    // PRODUCTS
-    // ─────────────────────────────────────────────────────────────
-    productsList: publicProcedure
-      .input(z.object({ limit: z.number().default(50) }).optional())
-      .query(async ({ input }) => {
-        if (!supabase) return [];
-        const { data } = await supabase
-          .from("products")
-          .select("*")
-          .order("name")
-          .limit(input?.limit || 50);
-        return (data || []) as Product[];
-      }),
-
-    productsSearch: publicProcedure
-      .input(z.object({ query: z.string().min(1) }))
-      .query(async ({ input }) => {
-        if (!supabase) return [];
-        const { data } = await supabase
-          .from("products")
-          .select("*")
-          .or(`name.ilike.%${input.query}%,barcode.eq.${input.query}`)
-          .limit(20);
-        return (data || []) as Product[];
-      }),
-
-    productsCreate: protectedProcedure
-      .input(z.object({
-        name: z.string().min(1),
-        barcode: z.string().optional(),
-        category: z.string().optional(),
-        image_url: z.string().optional(),
-      }))
-      .mutation(async ({ input }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        const { data, error } = await supabase
-          .from("products")
-          .insert({
-            name: input.name,
-            barcode: input.barcode || null,
-            category: input.category || null,
-            image_url: input.image_url || null,
-          })
-          .select()
-          .single();
-        
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return data as Product;
-      }),
-
-    productsGetOrCreate: protectedProcedure
-      .input(z.object({
-        name: z.string().min(1),
-        barcode: z.string().optional(),
-        category: z.string().optional(),
-      }))
-      .mutation(async ({ input }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        // Try to find by barcode first, then by name
-        let product: Product | null = null;
-        
-        if (input.barcode) {
-          const { data } = await supabase
-            .from("products")
-            .select("*")
-            .eq("barcode", input.barcode)
-            .single();
-          product = data;
-        }
-        
-        if (!product) {
-          const { data } = await supabase
-            .from("products")
-            .select("*")
-            .ilike("name", input.name)
-            .single();
-          product = data;
-        }
-        
-        if (product) return product;
-        
-        // Create new product
-        const { data, error } = await supabase
-          .from("products")
-          .insert({
-            name: input.name,
-            barcode: input.barcode || null,
-            category: input.category || null,
-          })
-          .select()
-          .single();
-        
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return data as Product;
-      }),
-
-    // ─────────────────────────────────────────────────────────────
-    // STORES
-    // ─────────────────────────────────────────────────────────────
-    storesList: publicProcedure.query(async () => {
-      if (!supabase) return [];
-      const { data } = await supabase
-        .from("stores")
-        .select("*")
-        .eq("is_deleted", false)
-        .order("name");
-      return (data || []) as Store[];
-    }),
-
-    storesNearby: publicProcedure
-      .input(z.object({
-        latitude: z.number(),
-        longitude: z.number(),
-        radiusKm: z.number().default(5),
-      }))
-      .query(async ({ input }) => {
-        if (!supabase) return [];
-        
-        // Using PostGIS ST_DWithin for radius search
-        const { data, error } = await supabase.rpc("stores_nearby", {
-          lat: input.latitude,
-          lng: input.longitude,
-          radius_km: input.radiusKm,
-        });
-        
-        if (error) {
-          console.warn("PostGIS query failed, falling back to basic query:", error.message);
-          // Fallback: return all stores (for development without PostGIS)
-          const { data: allStores } = await supabase
-            .from("stores")
-            .select("*")
-            .eq("is_deleted", false);
-          return (allStores || []) as Store[];
-        }
-        
-        return (data || []) as Store[];
-      }),
-
-    storesGetById: publicProcedure
-      .input(z.object({ storeId: z.string().uuid() }))
-      .query(async ({ input }) => {
-        if (!supabase) return null;
-        const { data } = await supabase
-          .from("stores")
-          .select("*")
-          .eq("id", input.storeId)
-          .eq("is_deleted", false)
-          .maybeSingle();
-        return data as Store | null;
-      }),
-
-    storesCreate: protectedProcedure
-      .input(z.object({
-        name: z.string().min(1),
-        address: z.string().optional(),
-        latitude: z.number(),
-        longitude: z.number(),
-      }))
-      .mutation(async ({ input }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        const { data, error } = await supabase
-          .from("stores")
-          .insert({
-            name: input.name,
-            address: input.address || null,
-            latitude: input.latitude,
-            longitude: input.longitude,
-          })
-          .select()
-          .single();
-        
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return data as Store;
-      }),
-
-    storesGetOrCreate: protectedProcedure
-      .input(z.object({
-        name: z.string().min(1),
-        address: z.string().optional(),
-        latitude: z.number(),
-        longitude: z.number(),
-      }))
-      .mutation(async ({ input }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        // Look for existing store by name (fuzzy match)
-        const { data: existing } = await supabase
-          .from("stores")
-          .select("*")
-          .ilike("name", `%${input.name}%`)
-          .eq("is_deleted", false)
-          .limit(1)
-          .single();
-        
-        if (existing) return existing as Store;
-        
-        // Create new store
-        const { data, error } = await supabase
-          .from("stores")
-          .insert({
-            name: input.name,
-            address: input.address || null,
-            latitude: input.latitude,
-            longitude: input.longitude,
-          })
-          .select()
-          .single();
-        
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return data as Store;
-      }),
-
-    storesCheckDuplicate: protectedProcedure
-      .input(z.object({
-        name: z.string(),
-        address: z.string().optional(),
-        latitude: z.number(),
-        longitude: z.number(),
-      }))
-      .mutation(async ({ input }) => {
-        if (!supabase) return { status: "none" };
-
-        // 1. Check for exact name match
-        const { data: nameMatch } = await supabase
-          .from("stores")
-          .select("*")
-          .ilike("name", input.name) // Case-insensitive full match
-          .eq("is_deleted", false)
-          .maybeSingle();
-
-        if (nameMatch) {
-          return { status: "exact", message: "A store with this exact name already exists.", store: nameMatch };
-        }
-
-        // 2. Check for location proximity (approx 100m)
-        // Simple bounding box check for speed/simplicity without PostGIS complexity here
-        // 0.001 degrees is roughly 111 meters
-        const { data: locMatch } = await supabase
-          .from("stores")
-          .select("*")
-          .eq("is_deleted", false)
-          .gte("latitude", input.latitude - 0.001)
-          .lte("latitude", input.latitude + 0.001)
-          .gte("longitude", input.longitude - 0.001)
-          .lte("longitude", input.longitude + 0.001)
-          .limit(1)
-          .maybeSingle();
-
-        if (locMatch) {
-          return { status: "location", message: `A store is already at this location: "${locMatch.name}"`, store: locMatch };
-        }
-
-        return { status: "none" };
-      }),
-
-    storesRecordVisit: protectedProcedure
-      .input(z.object({ storeId: z.string().uuid() }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        // Just log it or update a last_visited timestamp if it existed. 
-        // For now, we'll just return success to satisfy the frontend.
-        return { success: true };
-      }),
-
-    storesSoftDelete: protectedProcedure
-      .input(z.object({ storeId: z.string().uuid() }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        const { error } = await supabase
-          .from("stores")
-          .update({ is_deleted: true })
-          .eq("id", input.storeId);
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return { success: true };
-      }),
-
-    storesVisited: protectedProcedure
-      .query(async ({ ctx }) => {
-        if (!supabase) return [];
-        
-        // 1. Get unique store_ids from user receipts
-        const { data: receipts } = await supabase
-          .from("receipts")
-          .select("store_id")
-          .eq("user_id", ctx.user.userId)
-          .not("store_id", "is", null);
-        
-        if (!receipts || receipts.length === 0) return [];
-
-        const storeIds = [...new Set(receipts.map(r => r.store_id))];
-        
-        // 2. Fetch store details
-        if (storeIds.length === 0) return [];
-
-        const { data: stores } = await supabase
-          .from("stores")
-          .select("*")
-          .in("id", storeIds)
-          .eq("is_deleted", false);
-          
-        return (stores || []) as Store[];
-      }),
-
-    storeStats: protectedProcedure
-      .input(z.object({ storeId: z.string().uuid() }))
-      .query(async ({ input, ctx }) => {
-        if (!supabase) return { totalSpent: 0, avgPerItem: 0, thisMonthSpent: 0, itemCount: 0 };
-
-        const now = new Date();
-        const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-
-        const { data: prices } = await supabase
-          .from("prices")
-          .select("price")
-          .eq("store_id", input.storeId)
-          .eq("user_id", ctx.user.userId);
-
-        const { data: monthlyPrices } = await supabase
-          .from("prices")
-          .select("price")
-          .eq("store_id", input.storeId)
-          .eq("user_id", ctx.user.userId)
-          .gte("detected_at", firstDayOfMonth);
-
-        const totalSpent = prices?.reduce((sum, p) => sum + Number(p.price), 0) || 0;
-        const itemCount = prices?.length || 0;
-        const avgPerItem = itemCount > 0 ? totalSpent / itemCount : 0;
-        const thisMonthSpent = monthlyPrices?.reduce((sum, p) => sum + Number(p.price), 0) || 0;
-
-        return { totalSpent, avgPerItem, thisMonthSpent, itemCount };
-      }),
-
-    // ─────────────────────────────────────────────────────────────
-    // PRICES
-    // ─────────────────────────────────────────────────────────────
-    pricesAdd: protectedProcedure
-      .input(z.object({
-        productId: z.string().uuid(),
-        storeId: z.string().uuid(),
-        price: z.number().positive(),
-        receiptImagePath: z.string().optional(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        const { data, error } = await supabase
-          .from("prices")
-          .insert({
-            product_id: input.productId,
-            store_id: input.storeId,
-            user_id: ctx.user.userId,
-            price: input.price,
-            receipt_image_path: input.receiptImagePath || null,
-          })
-          .select("*, products(*), stores(*)")
-          .single();
-        
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        console.log(`✅ Price added: ${input.price} for product ${input.productId}`);
-        return data as PriceWithDetails;
-      }),
-
-    pricesHistory: publicProcedure
-      .input(z.object({
-        productId: z.string().uuid(),
-        limit: z.number().default(100),
-      }))
-      .query(async ({ input }) => {
-        if (!supabase) return [];
-        
-        const { data } = await supabase
-          .from("prices")
-          .select("*, stores(name)")
-          .eq("product_id", input.productId)
-          .order("detected_at", { ascending: true })
-          .limit(input.limit);
-        
-        return data || [];
-      }),
-
-    pricesCheapest: publicProcedure
-      .input(z.object({
-        productId: z.string().uuid(),
-        latitude: z.number().optional(),
-        longitude: z.number().optional(),
-        radiusKm: z.number().default(10),
-      }))
-      .query(async ({ input }) => {
-        if (!supabase) return [];
-        
-        // Get most recent price for each store
-        const { data } = await supabase
-          .from("prices")
-          .select("*, stores(*)")
-          .eq("product_id", input.productId)
-          .order("detected_at", { ascending: false });
-        
-        if (!data || data.length === 0) return [];
-        
-        // Group by store and get latest price
-        const storeMap = new Map<string, any>();
-        for (const price of data) {
-          if (!storeMap.has(price.store_id)) {
-            storeMap.set(price.store_id, price);
-          }
-        }
-        
-        // Sort by price
-        const sorted = Array.from(storeMap.values()).sort((a, b) => a.price - b.price);
-        return sorted;
-      }),
-
-    pricesRecent: publicProcedure
-      .input(z.object({ limit: z.number().default(20) }).optional())
-      .query(async ({ input }) => {
-        if (!supabase) return [];
-        
-        const { data } = await supabase
-          .from("prices")
-          .select("*, products(*), stores(*)")
-          .order("detected_at", { ascending: false })
-          .limit(input?.limit || 20);
-        
-        return (data || []) as PriceWithDetails[];
-      }),
-
-    pricesByStore: protectedProcedure
-      .input(z.object({ 
-        storeId: z.string().uuid(),
-        limit: z.number().default(50)
-      }))
-      .query(async ({ input, ctx }) => {
-        if (!supabase) return [];
-        
-        const { data } = await supabase
-          .from("prices")
-          .select("*, products(*)")
-          .eq("store_id", input.storeId)
-          .eq("user_id", ctx.user.userId)
-          .order("detected_at", { ascending: false })
-          .limit(input.limit);
-        
-        return (data || []) as PriceWithDetails[];
-      }),
-
-    // ─────────────────────────────────────────────────────────────
-    // AI RECEIPT PARSING
-    // ─────────────────────────────────────────────────────────────
-    receiptsParseWithAI: protectedProcedure
-      .input(z.object({ imageBase64: z.string() }))
-      .mutation(async ({ input }): Promise<ParsedReceipt> => {
-        return await parseReceiptImage(input.imageBase64);
-      }),
-
-    receiptsBulkSave: protectedProcedure
-      .input(z.object({
-        storeId: z.string().uuid(),
-        storeLocation: z.string().optional(),
-        totalPrice: z.number().optional(),
-        receiptDate: z.string().optional(),
-        receiptTime: z.string().optional(),
-        currency: z.string().default('USD'),
-        items: z.array(z.object({
-          productId: z.string().uuid(),
-          price: z.number().positive(),
-          quantity: z.number().optional(),
-          weight: z.string().optional(),
-          unitPrice: z.number().optional(),
-          tags: z.array(z.string()).optional(),
-        })),
-        receiptImagePath: z.string().optional(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        // Create receipt record first
-        const { data: receipt, error: receiptError } = await supabase
-          .from("receipts")
-          .insert({
-            user_id: ctx.user.userId,
-            store_id: input.storeId,
-            total_price: input.totalPrice || null,
-            store_location: input.storeLocation || null,
-            receipt_date: input.receiptDate || null,
-            receipt_time: input.receiptTime || null,
-            currency: input.currency,
-            image_path: input.receiptImagePath || null,
-          })
-          .select()
-          .single();
-        
-        if (receiptError) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: receiptError.message });
-        
-        // Create price records linked to receipt
-        const priceRecords = input.items.map((item) => ({
-          product_id: item.productId,
-          store_id: input.storeId,
-          user_id: ctx.user.userId,
-          price: item.price,
-          quantity: Math.round(item.quantity || 1),
-          weight: item.weight || null,
-          unit_price: item.unitPrice || null,
-          tags: item.tags || null,
-          currency: input.currency,
-          receipt_id: receipt.id,
-          receipt_image_path: input.receiptImagePath || null,
-          purchase_time: input.receiptDate ? new Date(`${input.receiptDate}T${input.receiptTime || '12:00'}:00`).toISOString() : new Date().toISOString(),
-        }));
-        
-        const { data, error } = await supabase
-          .from("prices")
-          .insert(priceRecords)
-          .select();
-        
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        
-        console.log(`✅ Bulk saved ${input.items.length} prices in receipt ${receipt.id}`);
-        return { saved: data?.length || 0, receiptId: receipt.id };
-      }),
-
-    receiptsList: protectedProcedure
-      .input(z.object({ limit: z.number().default(20) }).optional())
-      .query(async ({ ctx, input }) => {
-        if (!supabase) return [];
-        
-        const { data } = await supabase
-          .from("receipts")
-          .select("*, stores(*)")
-          .eq("user_id", ctx.user.userId)
-          .eq("is_deleted", false)
-          .order("created_at", { ascending: false })
-          .limit(input?.limit || 20);
-        
-        return (data || []) as ReceiptWithDetails[];
-      }),
-
-    receiptsGetById: protectedProcedure
-      .input(z.object({ receiptId: z.string().uuid() }))
-      .query(async ({ input }) => {
-        if (!supabase) return null;
-        
-        const { data: receipt } = await supabase
-          .from("receipts")
-          .select("*, stores(*)")
-          .eq("id", input.receiptId)
-          .single();
-        
-        if (!receipt) return null;
-        
-        // Get associated prices
-        const { data: prices } = await supabase
-          .from("prices")
-          .select("*, products(*)")
-          .eq("receipt_id", input.receiptId)
-          .order("detected_at", { ascending: false });
-        
-        return { ...receipt, prices: prices || [] } as ReceiptWithDetails;
-      }),
-
-    receiptsSoftDelete: protectedProcedure
-      .input(z.object({ receiptId: z.string().uuid() }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        const { error } = await supabase
-          .from("receipts")
-          .update({ is_deleted: true })
-          .eq("id", input.receiptId)
-          .eq("user_id", ctx.user.userId);
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return { success: true };
-      }),
-
-    // ─────────────────────────────────────────────────────────────
-    // HEALTH CHECK
-    // ─────────────────────────────────────────────────────────────
-    // ─────────────────────────────────────────────────────────────
-    // RANKINGS & PROFILE
-    // ─────────────────────────────────────────────────────────────
-    rankingsGetTop: publicProcedure.query(async () => {
-      if (!supabase) return [];
-      
-      const { data, error } = await supabase.rpc("get_top_contributors", { lim: 10 });
-      
-      if (error) {
-        console.error("Ranking RPC failed:", error.message);
-        return [];
-      }
-      
-      return (data || []) as { userId: string; count: number }[];
-    }),
-
-    userProfileGet: protectedProcedure.query(async ({ ctx }) => {
-      if (!supabase) return { priceCount: 0, receiptCount: 0 };
-      
-      const { count: priceCount } = await supabase
-        .from("prices")
-        .select("*", { count: "exact", head: true })
-        .eq("user_id", ctx.user.userId);
-        
-      const { count: receiptCount } = await supabase
-        .from("receipts")
-        .select("*", { count: "exact", head: true })
-        .eq("user_id", ctx.user.userId);
-        
-      return {
-        userId: ctx.user.userId,
-        priceCount: priceCount || 0,
-        receiptCount: receiptCount || 0,
-      };
-    }),
-    
-    // ─────────────────────────────────────────────────────────────
-    // VOTING
-    // ─────────────────────────────────────────────────────────────
-    voteGetCounts: publicProcedure
-      .input(z.object({
-        targetType: z.enum(['product', 'price', 'discussion', 'store']),
-        targetId: z.string().uuid(),
-      }))
-      .query(async ({ input }) => {
-        const db = supabase;
-        if (!db) return { upvotes: 0, downvotes: 0 };
-        
-        const { data, error } = await db.rpc('get_vote_counts', {
-          p_target_type: input.targetType,
-          p_target_id: input.targetId,
-        });
-        
-        if (error) {
-          // Fallback if RPC fails
-          const { data: votes } = await db
-            .from('votes')
-            .select('vote_type')
-            .eq('target_type', input.targetType)
-            .eq('target_id', input.targetId);
-            
-          const upvotes = votes?.filter(v => v.vote_type === 'up').length || 0;
-          const downvotes = votes?.filter(v => v.vote_type === 'down').length || 0;
-          return { upvotes, downvotes };
-        }
-        
-        return {
-          upvotes: Number(data[0]?.upvotes || 0),
-          downvotes: Number(data[0]?.downvotes || 0),
-        };
-      }),
-
-    voteGetUserVote: protectedProcedure
-      .input(z.object({
-        targetType: z.enum(['product', 'price', 'discussion', 'store']),
-        targetId: z.string().uuid(),
-      }))
-      .query(async ({ input, ctx }) => {
-        const db = supabase;
-        if (!db) return null;
-        
-        const { data } = await db
-          .from('votes')
-          .select('vote_type')
-          .eq('user_id', ctx.user.userId)
-          .eq('target_type', input.targetType)
-          .eq('target_id', input.targetId)
-          .maybeSingle();
-          
-        return data?.vote_type || null;
-      }),
-
-    voteSubmit: protectedProcedure
-      .input(z.object({
-        targetType: z.enum(['product', 'price', 'discussion', 'store']),
-        targetId: z.string().uuid(),
-        voteType: z.enum(['up', 'down']),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        const { error } = await supabase
-          .from('votes')
-          .upsert({
-            user_id: ctx.user.userId,
-            target_type: input.targetType,
-            target_id: input.targetId,
-            vote_type: input.voteType,
-          }, { 
-            onConflict: 'user_id,target_type,target_id' 
-          });
-          
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return { success: true };
-      }),
-
-    voteRemove: protectedProcedure
-      .input(z.object({
-        targetType: z.enum(['product', 'price', 'discussion', 'store']),
-        targetId: z.string().uuid(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        const { error } = await supabase
-          .from('votes')
-          .delete()
-          .eq('user_id', ctx.user.userId)
-          .eq('target_type', input.targetType)
-          .eq('target_id', input.targetId);
-          
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return { success: true };
-      }),
-
-    // ─────────────────────────────────────────────────────────────
-    // DISCUSSIONS
-    // ─────────────────────────────────────────────────────────────
-    discussionList: publicProcedure
-      .input(z.object({
-        targetType: z.enum(['product', 'price', 'store']),
-        targetId: z.string().uuid(),
-        page: z.number().default(1),
-        pageSize: z.number().default(10),
-      }))
-      .query(async ({ input }) => {
-        if (!supabase) return { discussions: [], totalCount: 0, totalPages: 0, currentPage: 1, hasMore: false };
-        
-        const from = (input.page - 1) * input.pageSize;
-        const to = from + input.pageSize - 1;
-        
-        const { data, count, error } = await supabase
-          .from('discussions')
-          .select('*', { count: 'exact' })
-          .eq('target_type', input.targetType)
-          .eq('target_id', input.targetId)
-          .order('created_at', { ascending: false })
-          .range(from, to);
-          
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        
-        const totalCount = count || 0;
-        const totalPages = Math.ceil(totalCount / input.pageSize);
-        
-        return {
-          discussions: data as Discussion[],
-          totalCount,
-          totalPages,
-          currentPage: input.page,
-          hasMore: input.page < totalPages,
-        };
-      }),
-
-    discussionCreate: protectedProcedure
-      .input(z.object({
-        targetType: z.enum(['product', 'price', 'store']),
-        targetId: z.string().uuid(),
-        content: z.string().min(1).max(2000),
-        parentId: z.string().uuid().optional(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        const { data, error } = await supabase
-          .from('discussions')
-          .insert({
-            user_id: ctx.user.userId,
-            target_type: input.targetType,
-            target_id: input.targetId,
-            content: input.content,
-            parent_id: input.parentId || null,
-          })
-          .select()
-          .single();
-          
-          if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return data as Discussion;
-      }),
-
-    // ─────────────────────────────────────────────────────────────
-    // BOOKMARKS & ALERTS
-    // ─────────────────────────────────────────────────────────────
-    bookmarksList: protectedProcedure
-      .input(z.object({
-        page: z.number().default(1),
-        pageSize: z.number().default(20),
-      }))
-      .query(async ({ input, ctx }) => {
-        const db = supabase;
-        if (!db) return { bookmarks: [], totalCount: 0, totalPages: 0, currentPage: 1, hasMore: false };
-        
-        const from = (input.page - 1) * input.pageSize;
-        const to = from + input.pageSize - 1;
-        
-        // 1. Get bookmarks
-        const { data, count, error } = await db
-          .from('bookmarks')
-          .select('*, products(*)', { count: 'exact' })
-          .eq('user_id', ctx.user.userId)
-          .order('created_at', { ascending: false })
-          .range(from, to);
-          
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        
-        // 2. For each bookmark, fetch price stats
-        const bookmarksWithStats = await Promise.all((data || []).map(async (bookmark) => {
-          const { data: prices } = await db
-            .from('prices')
-            .select('price, detected_at, stores(name)')
-            .eq('product_id', bookmark.product_id)
-            .order('detected_at', { ascending: false });
-            
-          const priceValues = (prices || []).map(p => Number(p.price));
-          const stats = {
-            lowest: priceValues.length > 0 ? Math.min(...priceValues) : null,
-            average: priceValues.length > 0 ? priceValues.reduce((a, b) => a + b, 0) / priceValues.length : null,
-            highest: priceValues.length > 0 ? Math.max(...priceValues) : null,
-            recentPrices: prices || [],
-          };
-          
-          return {
-            ...bookmark,
-            priceStats: stats,
-          };
-        }));
-        
-        const totalCount = count || 0;
-        const totalPages = Math.ceil(totalCount / input.pageSize);
-        
-        return {
-          bookmarks: bookmarksWithStats,
-          totalCount,
-          totalPages,
-          currentPage: input.page,
-          hasMore: input.page < totalPages,
-        };
-      }),
-
-    bookmarkCreate: protectedProcedure
-      .input(z.object({
-        productId: z.string().uuid(),
-        notifyOnPriceDrop: z.boolean().default(true),
-        targetPrice: z.number().optional(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        const { data, error } = await supabase
-          .from('bookmarks')
-          .upsert({
-            user_id: ctx.user.userId,
-            product_id: input.productId,
-            notify_on_price_drop: input.notifyOnPriceDrop,
-            target_price: input.targetPrice || null,
-          }, { 
-            onConflict: 'user_id,product_id' 
-          })
-          .select()
-          .single();
-          
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return data as Bookmark;
-      }),
-
-    bookmarkDelete: protectedProcedure
-      .input(z.object({
-        productId: z.string().uuid(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        const { error } = await supabase
-          .from('bookmarks')
-          .delete()
-          .eq('user_id', ctx.user.userId)
-          .eq('product_id', input.productId);
-          
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return { success: true };
-      }),
-
-    bookmarkCheck: protectedProcedure
-      .input(z.object({
-        productId: z.string().uuid(),
-      }))
-      .query(async ({ input, ctx }) => {
-        if (!supabase) return null;
-        
-        const { data } = await supabase
-          .from('bookmarks')
-          .select('*')
-          .eq('user_id', ctx.user.userId)
-          .eq('product_id', input.productId)
-          .maybeSingle();
-          
-        return data as Bookmark | null;
-      }),
-
-    priceAlertsList: protectedProcedure
-      .input(z.object({
-        unreadOnly: z.boolean().default(false),
-        limit: z.number().default(50),
-      }))
-      .query(async ({ input, ctx }) => {
-        const db = supabase;
-        if (!db) return { alerts: [], totalCount: 0 };
-        
-        let query = db
-          .from('price_alerts')
-          .select('*, products(*)', { count: 'exact' })
-          .eq('user_id', ctx.user.userId)
-          .order('created_at', { ascending: false })
-          .limit(input.limit);
-          
-        if (input.unreadOnly) {
-          query = query.eq('is_read', false);
-        }
-        
-        const { data, count, error } = await query;
-          
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        
-        return {
-          alerts: data as PriceAlert[],
-          totalCount: count || 0,
-        };
-      }),
-
-    priceAlertsMarkAsRead: protectedProcedure
-      .input(z.object({
-        alertId: z.string().uuid().optional(), // If null, mark all as read
-      }))
-      .mutation(async ({ input, ctx }) => {
-        const db = supabase;
-        if (!db) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
-        
-        let query = db
-          .from('price_alerts')
-          .update({ is_read: true })
-          .eq('user_id', ctx.user.userId);
-          
-        if (input.alertId) {
-          query = query.eq('id', input.alertId);
-        } else {
-          query = query.eq('is_read', false);
-        }
-        
-        const { error } = await query;
-          
-        if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
-        return { success: true };
-      }),
-
-    health: publicProcedure.query(() => ({
-      status: "ok",
-      supabase: !!supabase,
-      timestamp: new Date().toISOString(),
-    })),
-  });
-}
-
-export type AppRouter = ReturnType<typeof createTRPCRouter>;
-
 function createAuthContext(server: any) {
   return async ({ req }: { req: FastifyRequest }) => {
     let user: { userId: string; role?: string } | null = null;
 
-    try {
-      const auth = (req.headers.authorization as string) ?? "";
-      if (auth.startsWith("Bearer ")) {
-        const token = auth.slice(7);
-        
-        try {
-          // 1. Try verifiable local JWT first (for testuser)
-          user = server.jwt.verify(token) as { userId: string; role?: string };
-        } catch (e) {
-          // 2. If valid locally, maybe it's a Supabase token?
-          if (supabase) {
-            const { data: { user: sbUser }, error } = await supabase.auth.getUser(token);
-            if (!error && sbUser) {
-              user = { 
-                userId: sbUser.id,
-                role: sbUser.role 
-              };
-            }
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith("Bearer ")) {
+      const token = authHeader.slice(7);
+      try {
+        const decoded = server.jwt.verify(token);
+        // Handle different token formats
+        if (typeof decoded === "object") {
+          if (decoded.sub) {
+            user = { userId: decoded.sub, role: decoded.role };
+          } else if (decoded.userId) {
+            user = { userId: decoded.userId, role: decoded.role };
           }
         }
-        
-        // AUTO-FIX: Legacy tokens might have "user-123" which crashes Postgres UUID columns
-        // We invisibly swap it to the valid UUID on the fly
-        if (user?.userId && !user.userId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
-          console.log(`⚠️  Legacy ID detected (${user.userId}). Auto-migrating to valid UUID.`);
-          user.userId = "11111111-1111-1111-1111-111111111111"; // testuser UUID
-        }
-
-        if (user) {
-           console.log("✅ Authenticated:", user.userId);
+      } catch (err: any) {
+        // If local verification fails (e.g. invalid algorithm ES256 vs HS256), try Supabase
+        if (supabase) {
+          try {
+            const { data, error } = await supabase.auth.getUser(token);
+            if (!error && data.user) {
+              user = { userId: data.user.id, role: data.user.role };
+            } else {
+              console.log("⚠️ Supabase verification failed:", error?.message);
+            }
+          } catch (sbError) {
+             console.error("❌ Supabase auth error:", sbError);
+          }
+        } else {
+           console.log("🔑 JWT verification failed and Supabase not configured:", err.message);
         }
       }
-    } catch (error) {
-      console.log("⚠️ Auth failed:", error instanceof Error ? error.message : String(error));
     }
 
     return { user };
@@ -1151,8 +126,7 @@ function createAuthContext(server: any) {
 }
 
 async function setupRoutes(server: any) {
-  const appRouter = createTRPCRouter(server);
-
+  // tRPC handler
   await server.register(fastifyTRPCPlugin, {
     prefix: "/trpc",
     trpcOptions: {
@@ -1161,96 +135,75 @@ async function setupRoutes(server: any) {
     },
   });
 
-  // Login endpoint
-  server.post("/login", async (req: FastifyRequest, reply: FastifyReply) => {
-    const { username } = req.body as { username: string };
-    
-    // Use a static UUID for testuser to keep data persistent during dev
-    const userId = username === "testuser" 
-      ? "11111111-1111-1111-1111-111111111111" 
-      : "22222222-2222-2222-2222-222222222222"; 
-    
-    const token = await reply.jwtSign({ userId, role: "user" });
-    
-    return reply.send({ token, userId });
-  });
-
-  // Google OAuth endpoint
-  server.post("/auth/google", async (req: FastifyRequest, reply: FastifyReply) => {
-    const { accessToken } = req.body as { accessToken: string };
-    
-    try {
-      // For mobile apps using expo-auth-session, we usually verify via the userinfo endpoint 
-      // or using a proper ID token if configured. 
-      // For this implementation, we'll fetch user info from Google's API to verify the token.
-      const response = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-
-      if (!response.ok) {
-        throw new Error("Invalid Google token");
-      }
-
-      const userInfo = await response.json() as { sub: string, email: string, name: string };
-      
-      // Generate a deterministic UUID from the Google 'sub'
-      // This ensures the same Google user always gets the same UUID
-      const hash = createHash("md5").update(userInfo.sub).digest("hex");
-      const userId = `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
-
-      const token = await reply.jwtSign({ 
-        userId, 
-        role: "user",
-        email: userInfo.email,
-        name: userInfo.name 
-      });
-
-      return reply.send({ token, userId });
-    } catch (error) {
-      console.error("Google Auth failed:", error);
-      return reply.status(401).send({ error: "Authentication failed" });
-    }
-  });
-
-  // Health check
+  // Health endpoint
   server.get("/health", async () => ({
     status: "ok",
     supabase: !!supabase,
     timestamp: new Date().toISOString(),
   }));
+
+  // Token generation endpoint (for development/testing)
+  server.post("/auth/token", async (request: FastifyRequest, reply: FastifyReply) => {
+    const { userId, expiresIn } = request.body as { userId?: string; expiresIn?: string };
+    
+    if (!userId) {
+      return reply.status(400).send({ error: "userId is required" });
+    }
+
+    const token = server.jwt.sign(
+      { sub: userId, role: "user" },
+      { expiresIn: expiresIn || "24h" }
+    );
+
+    return { token, userId, expiresIn: expiresIn || "24h" };
+  });
+
+  // Static file serving for uploads
+  server.get("/uploads/:filename", async (request: FastifyRequest, reply: FastifyReply) => {
+    const { filename } = request.params as { filename: string };
+    const filepath = path.join(process.cwd(), "uploads", filename);
+    
+    try {
+      const fs = await import("fs/promises");
+      const file = await fs.readFile(filepath);
+      reply.type("image/jpeg").send(file);
+    } catch {
+      reply.status(404).send({ error: "File not found" });
+    }
+  });
 }
 
 async function setupNgrokTunnel() {
   if (!CONFIG.NGROK_AUTH_TOKEN) {
-    console.log("⚠️ NGROK_AUTH_TOKEN not set - skipping tunnel");
-    return;
+    console.log("⚠️ NGROK_AUTH_TOKEN not set, skipping tunnel");
+    return null;
   }
 
   try {
-    console.log("🔗 Starting ngrok tunnel...");
+    await ngrok.authtoken(CONFIG.NGROK_AUTH_TOKEN);
     const url = await ngrok.connect({
-      port: CONFIG.PORT,
-      authtoken: CONFIG.NGROK_AUTH_TOKEN,
+      addr: CONFIG.PORT,
       hostname: CONFIG.NGROK_DOMAIN,
     });
-    console.log(`🔗 Public API: ${url}/trpc`);
-  } catch (error) {
-    console.warn("⚠️ ngrok failed:", error instanceof Error ? error.message : String(error));
+    console.log(`🌐 Ngrok tunnel: ${url}`);
+    return url;
+  } catch (error: any) {
+    console.error("❌ Ngrok setup failed:", error.message);
+    return null;
   }
 }
 
 async function start() {
-  try {
-    const server = await createServer();
-    await setupRoutes(server);
-    await server.listen({ port: CONFIG.PORT, host: "0.0.0.0" });
-    console.log(`🚀 Server running on http://0.0.0.0:${CONFIG.PORT}`);
-    await setupNgrokTunnel();
-    console.log("✅ Server ready");
-  } catch (error) {
-    console.error("❌ Failed to start:", error);
-    process.exit(1);
-  }
+  const server = await createServer();
+  await setupRoutes(server);
+
+  await server.listen({ port: CONFIG.PORT, host: "0.0.0.0" });
+  console.log(`✅ Server started on port ${CONFIG.PORT}`);
+
+  await setupNgrokTunnel();
 }
+
+// Re-export types for client
+export type { AppRouter };
 
 start();
