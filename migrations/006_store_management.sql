@@ -6,6 +6,12 @@
 -- ─────────────────────────────────────────────────────────────
 DO $$ 
 BEGIN
+  -- created_by for tracking store creator (needed for RLS)
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                 WHERE table_name = 'stores' AND column_name = 'created_by') THEN
+    ALTER TABLE stores ADD COLUMN created_by UUID REFERENCES auth.users(id) ON DELETE SET NULL;
+  END IF;
+
   -- is_deleted for soft delete
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                  WHERE table_name = 'stores' AND column_name = 'is_deleted') THEN
@@ -70,11 +76,35 @@ $$;
 -- Allow users to update their own data (for soft delete)
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can update stores') THEN
-    CREATE POLICY "Users can update stores" ON stores FOR UPDATE USING (auth.uid() = created_by);
+  -- Update the INSERT policy to track who created the store
+  -- Drop the old policy if it exists and create a new one
+  IF EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'stores' AND policyname = 'Stores can be created by anyone') THEN
+    DROP POLICY "Stores can be created by anyone" ON stores;
   END IF;
   
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can update receipts') THEN
-    CREATE POLICY "Users can update receipts" ON receipts FOR UPDATE USING (auth.uid() = user_id);
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'stores' AND policyname = 'Authenticated users can create stores') THEN
+    CREATE POLICY "Authenticated users can create stores"
+      ON stores
+      FOR INSERT
+      TO authenticated
+      WITH CHECK (auth.uid() = created_by);
+  END IF;
+  
+  -- Allow users to update only the stores they created (or stores with NULL created_by for backward compatibility)
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'stores' AND policyname = 'Users can update stores') THEN
+    CREATE POLICY "Users can update stores" 
+      ON stores 
+      FOR UPDATE 
+      USING (auth.uid() = created_by OR created_by IS NULL)
+      WITH CHECK (auth.uid() = created_by);
+  END IF;
+  
+  -- Allow users to update only their own receipts
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'receipts' AND policyname = 'Users can update receipts') THEN
+    CREATE POLICY "Users can update receipts" 
+      ON receipts 
+      FOR UPDATE 
+      USING (auth.uid() = user_id)
+      WITH CHECK (auth.uid() = user_id);
   END IF;
 END $$;
