@@ -8,6 +8,7 @@ export const pricesRouter = router({
       productId: z.string().uuid(),
       storeId: z.string().uuid(),
       price: z.number().positive(),
+      originalPrice: z.number().optional(),
       receiptImagePath: z.string().optional(),
     }))
     .mutation(async ({ input, ctx }) => {
@@ -20,6 +21,7 @@ export const pricesRouter = router({
           store_id: input.storeId,
           user_id: ctx.user.userId,
           price: input.price,
+          original_price: input.originalPrice || null,
           receipt_image_path: input.receiptImagePath || null,
         })
         .select("*, products(*), stores(*)")

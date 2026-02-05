@@ -284,16 +284,62 @@ export const appRouter = router({
       receiptDate: z.string().optional(),
       receiptTime: z.string().optional(),
       currency: z.string().default('USD'),
-      items: z.array(z.object({ productId: z.string().uuid(), price: z.number().positive(), quantity: z.number().optional(), weight: z.string().optional(), unitPrice: z.number().optional(), tags: z.array(z.string()).optional() })),
+      status: z.enum(['complete', 'draft']).default('complete'),
+      items: z.array(z.object({ productId: z.string().uuid(), price: z.number().positive(), quantity: z.number().optional(), weight: z.string().optional(), unitPrice: z.number().optional(), originalPrice: z.number().optional(), tags: z.array(z.string()).optional() })),
       receiptImagePath: z.string().optional(),
     }))
     .mutation(async ({ input, ctx }) => {
       if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
       
-      const { data: receipt, error: receiptError } = await supabase.from("receipts").insert({ user_id: ctx.user.userId, store_id: input.storeId, total_price: input.totalPrice || null, store_location: input.storeLocation || null, receipt_date: input.receiptDate || null, receipt_time: input.receiptTime || null, currency: input.currency, image_path: input.receiptImagePath || null }).select().single();
+      const { data: receipt, error: receiptError } = await supabase.from("receipts")
+        .insert({ 
+          user_id: ctx.user.userId, 
+          store_id: input.storeId, 
+          total_price: input.totalPrice || null, 
+          store_location: input.storeLocation || null, 
+          receipt_date: input.receiptDate || null, 
+          receipt_time: input.receiptTime || null, 
+          currency: input.currency, 
+          status: input.status,
+          image_path: input.receiptImagePath || null,
+          items_snapshot: input.status === 'draft' ? input.items : null,
+        })
+        .select()
+        .single();
+
       if (receiptError) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: receiptError.message });
       
-      const priceRecords = input.items.map((item) => ({ product_id: item.productId, store_id: input.storeId, user_id: ctx.user.userId, price: item.price, quantity: Math.round(item.quantity || 1), weight: item.weight || null, unit_price: item.unitPrice || null, tags: item.tags || null, currency: input.currency, receipt_id: receipt.id, receipt_image_path: input.receiptImagePath || null, purchase_time: input.receiptDate ? new Date(`${input.receiptDate}T${input.receiptTime || '12:00'}:00`).toISOString() : new Date().toISOString() }));
+      if (input.status === 'draft') {
+        return { saved: 0, receiptId: receipt.id };
+      }
+
+      const purchaseTime = (() => {
+        if (!input.receiptDate) return new Date().toISOString();
+        try {
+          const d = new Date(`${input.receiptDate}T${input.receiptTime || '12:00'}:00`);
+          if (!isNaN(d.getTime())) return d.toISOString();
+          const d2 = new Date(input.receiptDate);
+          if (!isNaN(d2.getTime())) return d2.toISOString();
+        } catch (e) {}
+        return new Date().toISOString();
+      })();
+
+      const priceRecords = input.items.map((item) => ({ 
+        product_id: item.productId, 
+        store_id: input.storeId, 
+        user_id: ctx.user.userId, 
+        price: item.price, 
+        quantity: Math.round(item.quantity || 1), 
+        weight: item.weight || null, 
+        unit_price: item.unitPrice || null, 
+        original_price: item.originalPrice || null,
+        tags: item.tags || null, 
+        currency: input.currency, 
+        receipt_id: receipt.id, 
+        receipt_image_path: input.receiptImagePath || null, 
+        purchase_time: purchaseTime,
+      }));
+
       const { data, error } = await supabase.from("prices").insert(priceRecords).select();
       if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
       return { saved: data?.length || 0, receiptId: receipt.id };
@@ -302,15 +348,19 @@ export const appRouter = router({
   receiptsList: protectedProcedure
     .input(z.object({ 
       limit: z.number().default(20),
+      status: z.enum(['complete', 'draft']).optional(),
       startDate: z.string().optional(),
       endDate: z.string().optional(),
     }).optional())
     .query(async ({ ctx, input }) => {
       if (!supabase) return [];
+      const statusFilter = input?.status || 'complete';
       let query = supabase.from("receipts")
         .select("*, stores(*)")
         .eq("user_id", ctx.user.userId)
         .eq("is_deleted", false)
+        .eq("status", statusFilter)
+        .order("receipt_date", { ascending: false })
         .order("created_at", { ascending: false });
         
       if (input?.startDate) {
@@ -330,6 +380,28 @@ export const appRouter = router({
       if (!supabase) return null;
       const { data: receipt } = await supabase.from("receipts").select("*, stores(*)").eq("id", input.receiptId).single();
       if (!receipt) return null;
+      
+      if (receipt.status === 'draft' && receipt.items_snapshot) {
+        const snapshotItems = receipt.items_snapshot as any[];
+        const productIds = snapshotItems.map(i => i.productId);
+        const { data: products } = await supabase.from("products").select("*").in("id", productIds);
+        const productsMap = new Map(products?.map(p => [p.id, p]));
+        
+        const items = snapshotItems.map((item, idx) => ({
+          id: `draft-${item.productId}-${idx}`,
+          receipt_id: receipt.id,
+          product_id: item.productId,
+          price: item.price,
+          quantity: item.quantity,
+          weight: item.weight,
+          unit_price: item.unitPrice,
+          discounted_price: item.discountedPrice,
+          tags: item.tags,
+          products: productsMap.get(item.productId) || { name: "Unknown Item" },
+        }));
+        return { ...receipt, prices: items };
+      }
+
       const { data: prices } = await supabase.from("prices").select("*, products(*)").eq("receipt_id", input.receiptId).order("detected_at", { ascending: false });
       return { ...receipt, prices: prices || [] };
     }),
@@ -340,6 +412,72 @@ export const appRouter = router({
       if (!supabase) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
       const { error } = await supabase.from("receipts").update({ is_deleted: true }).eq("id", input.receiptId).eq("user_id", ctx.user.userId);
       if (error) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: error.message });
+      return { success: true };
+    }),
+
+  receiptsCompleteDraft: protectedProcedure
+    .input(z.object({ receiptId: z.string().uuid() }))
+    .mutation(async ({ input, ctx }) => {
+      console.log(`🚀 [CompleteDraft] Finalizing receipt: ${input.receiptId} for user: ${ctx.user.userId}`);
+      if (!supabase) {
+        console.error("❌ [CompleteDraft] Supabase not configured");
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Database not configured" });
+      }
+      
+      const { data: receipt, error: fetchError } = await supabase.from("receipts").select("*").eq("id", input.receiptId).eq("user_id", ctx.user.userId).single();
+      
+      if (fetchError) {
+        console.error("❌ [CompleteDraft] Error fetching receipt:", fetchError);
+        throw new TRPCError({ code: "NOT_FOUND", message: "Receipt not found" });
+      }
+
+      if (!receipt || receipt.status === 'complete' || !receipt.items_snapshot) {
+        console.log(`ℹ️ [CompleteDraft] Receipt ${input.receiptId} already complete or no snapshot`);
+        return { success: true };
+      }
+
+      console.log(`📦 [CompleteDraft] Recreating ${receipt.items_snapshot.length} price records from snapshot`);
+      const items = receipt.items_snapshot as any[];
+      const purchaseTime = (() => {
+        if (!receipt.receipt_date) return receipt.created_at;
+        try {
+          const d = new Date(`${receipt.receipt_date}T${receipt.receipt_time || '12:00'}:00`);
+          if (!isNaN(d.getTime())) return d.toISOString();
+          const d2 = new Date(receipt.receipt_date);
+          if (!isNaN(d2.getTime())) return d2.toISOString();
+        } catch (e) {}
+        return receipt.created_at;
+      })();
+
+      const priceRecords = items.map((item: any) => ({
+        product_id: item.productId,
+        store_id: receipt.store_id,
+        user_id: ctx.user.userId,
+        price: item.price,
+        quantity: Math.round(item.quantity || 1),
+        weight: item.weight || null,
+        unit_price: item.unitPrice || null,
+        original_price: item.originalPrice || null,
+        tags: item.tags || null,
+        currency: receipt.currency,
+        receipt_id: receipt.id,
+        receipt_image_path: receipt.image_path || null,
+        purchase_time: purchaseTime,
+      }));
+
+      const { error: priceError } = await supabase.from("prices").insert(priceRecords);
+      if (priceError) {
+        console.error("❌ [CompleteDraft] Error inserting prices:", priceError);
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: `Failed to save items: ${priceError.message}` });
+      }
+
+      const { error: updateError } = await supabase.from("receipts").update({ status: 'complete', items_snapshot: null }).eq("id", input.receiptId);
+      if (updateError) {
+        console.error("❌ [CompleteDraft] Error updating receipt status:", updateError);
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: `Failed to update status: ${updateError.message}` });
+      }
+      
+      console.log(`✅ [CompleteDraft] Receipt ${input.receiptId} finalized successfully`);
       return { success: true };
     }),
 

@@ -49,6 +49,7 @@ export interface Price {
   quantity: number;
   weight: string | null;
   unit_price: number | null;
+  original_price: number | null;
   tags: string[] | null;
   currency: string;
   receipt_image_path: string | null;
