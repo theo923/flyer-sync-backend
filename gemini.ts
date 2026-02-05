@@ -20,6 +20,7 @@ export interface ParsedReceiptItem {
   weight?: string; // e.g. "200g", "1kg"
   unitPrice?: number; // Calculated $ per unit
   category?: string; // e.g. "Dairy", "Produce", "Beverages"
+  originalPrice?: number; // Pre-discount price if visible
   tags?: string[]; // "SALE", "ORGANIC", etc.
   imageUrl?: string; // From Google Search
 }
@@ -82,6 +83,7 @@ Return strictly valid JSON structure:
     "weight": "907g",
     "unitPrice": 0.66, // $/100g
     "category": "Pantry",
+    "originalPrice": 6.99,
     "tags": ["SALE"],
     "imageUrl": "https://..."
   }]
@@ -234,6 +236,7 @@ Only return the JSON object. Do not wrap in markdown code blocks.`;
         weight: item.weight,
         unitPrice: item.unitPrice,
         category: item.category,
+        originalPrice: Number(item.originalPrice) || undefined,
         tags: item.tags || [],
         imageUrl: item.imageUrl,
       };

@@ -20,13 +20,17 @@ export const rankingsRouter = router({
     
     const { count: priceCount } = await supabase
       .from("prices")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", ctx.user.userId);
+      .select("*, receipts!inner(*)", { count: "exact", head: true })
+      .eq("user_id", ctx.user.userId)
+      .eq("receipts.status", "complete")
+      .eq("receipts.is_deleted", false);
       
     const { count: receiptCount } = await supabase
       .from("receipts")
       .select("*", { count: "exact", head: true })
-      .eq("user_id", ctx.user.userId);
+      .eq("user_id", ctx.user.userId)
+      .eq("status", "complete") 
+      .eq("is_deleted", false);
       
     return {
       userId: ctx.user.userId,

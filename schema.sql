@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS prices (
   quantity INTEGER DEFAULT 1,
   weight TEXT,
   unit_price DECIMAL(10,2),
+  original_price DECIMAL(10,2),
   tags TEXT[],
   currency TEXT DEFAULT 'USD',
   receipt_image_path TEXT,
@@ -138,6 +139,9 @@ BEGIN
   END IF;
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'prices' AND column_name = 'receipt_id') THEN
     ALTER TABLE prices ADD COLUMN receipt_id UUID REFERENCES receipts(id) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'prices' AND column_name = 'original_price') THEN
+    ALTER TABLE prices ADD COLUMN original_price DECIMAL(10,2);
   END IF;
 END $$;
 
